@@ -10,6 +10,7 @@ Schedule: Daily at 2 AM UTC
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
@@ -127,7 +128,7 @@ with DAG(
         image="batch-processor:latest",
         api_version="auto",
         auto_remove="success",
-        network_mode="dataeng-q3-2025_ml-network",
+        network_mode=os.getenv("PIPELINE_DOCKER_NETWORK", "transaction-enrichment-network"),
         docker_url="unix://var/run/docker.sock",
         mount_tmp_dir=False,
         xcom_task_id="get_environment_vars",

@@ -23,6 +23,8 @@
 # 5. Run integration tests: cd pipeline/library && uv run pytest tests
 # 6. Commit changes with version update notes
 
+name: transaction-enrichment-pipeline
+
 services:
   postgres:
     image: postgres:15.10-alpine
@@ -239,6 +241,8 @@ services:
       AIRFLOW_CONN_POSTGRES_TRANSACTIONS: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
       AIRFLOW_CONN_MINIO_S3: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@${MINIO_HOST}:9000
       AIRFLOW_CONN_ML_API: http://${ML_API_HOST}:${ML_API_PORT}
+      # Network the DockerOperator attaches batch containers to (see networks below)
+      PIPELINE_DOCKER_NETWORK: transaction-enrichment-network
     volumes:
       - ./pipeline/application/batch/orchestration/dags:/opt/airflow/dags
       - airflow-data:/opt/airflow
@@ -362,4 +366,6 @@ volumes:
 
 networks:
   ml-network:
+    # Fixed name: the Airflow DockerOperator attaches batch containers to it by name
+    name: transaction-enrichment-network
     driver: bridge

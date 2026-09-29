@@ -4,16 +4,20 @@ help: ## Show this help message
 	@echo "Available commands:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}'
 
-infra: ## Start infrastructure services (postgres, kafka, minio, ml-api, adminer, kafka-ui, airflow)
+.env:
+	cp .env.example .env
+	@echo "Created .env from .env.example"
+
+infra: .env ## Start infrastructure services (postgres, kafka, minio, ml-api, adminer, kafka-ui, airflow)
 	docker-compose up -d postgres flyway adminer minio minio-init ml-api kafka kafka-init kafka-ui airflow
 
-streaming: ## Start streaming pipeline (producer-1, producer-2, consumer)
+streaming: .env ## Start streaming pipeline (producer-1, producer-2, consumer)
 	docker-compose --profile streaming up -d
 
-batch: ## Start batch pipeline
+batch: .env ## Start batch pipeline
 	docker-compose --profile batch up -d
 
-all: ## Start all services (infra + streaming + batch)
+all: .env ## Start all services (infra + streaming + batch)
 	docker-compose --profile all up -d
 
 up: infra ## Alias for 'infra' - start infrastructure only
@@ -31,7 +35,7 @@ status: ## Show status of all containers
 	@docker-compose ps
 	@echo ""
 	@echo "=== Network Status ==="
-	@docker network ls | grep -E "NETWORK ID|dataeng-q3-2025" || echo "No project networks found"
+	@docker network ls | grep -E "NETWORK ID|transaction-enrichment" || echo "No project networks found"
 
 logs-all: ## Follow all pipeline services logs (streaming + batch)
 	docker-compose logs -f streaming-producer-1 streaming-producer-2 streaming-consumer batch
@@ -71,7 +75,7 @@ clean-network: ## Fix network issues by removing orphaned containers and network
 	@echo "Stopping all containers..."
 	-docker-compose --profile all down --remove-orphans 2>/dev/null || true
 	@echo "Removing orphaned containers..."
-	-docker ps -aq --filter "label=com.docker.compose.project=dataeng-q3-2025" | xargs -r docker rm -f 2>/dev/null || true
+	-docker ps -aq --filter "label=com.docker.compose.project=transaction-enrichment-pipeline" | xargs -r docker rm -f 2>/dev/null || true
 	@echo "Cleaning networks..."
 	-docker network prune -f
 	@echo "✓ Network cleanup complete. Run 'make all' to restart services."

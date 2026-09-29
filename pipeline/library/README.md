@@ -365,7 +365,3 @@ ML_API_URL=http://ml-api:8000
 3. Add NumPy-style docstrings to all functions
 4. Write tests for new functionality
 5. Update this README for API changes
-
-## 📝 License
-
-Internal use only - Q3 2025 Data Engineering Project

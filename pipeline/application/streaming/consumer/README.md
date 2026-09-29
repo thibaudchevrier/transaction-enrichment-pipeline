@@ -551,7 +551,3 @@ error_producer.produce(
 4. **Create Dockerfile**: Package for Docker deployment
 5. **Add to docker-compose**: Integrate with existing services
 6. **Test End-to-End**: Producer → Consumer → Database verification
-
-## 📝 License
-
-Internal use only - Q3 2025 Data Engineering Project

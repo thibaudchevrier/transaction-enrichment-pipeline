@@ -470,7 +470,3 @@ The producer uses `asyncio.gather()` for parallel sending:
 - **Streaming Consumer** (`../consumer/`) - Consumes and processes messages
 - **Batch Pipeline** (`../../batch/`) - Historical processing
 - **Kafka** - Message broker
-
-## 📝 License
-
-Internal use only - Q3 2025 Data Engineering Project

@@ -383,7 +383,3 @@ batch/
 - **ML API** (`../../ml_api/`) - Transaction classification service
 - **Streaming Producer** (`../streaming/producer/`) - Real-time transaction simulation
 - **Streaming Consumer** (`../streaming/consumer/`) - Real-time processing
-
-## 📝 License
-
-Internal use only - Q3 2025 Data Engineering Project
