@@ -1,15 +1,16 @@
 """
 Tests for the Transaction Pydantic model.
 
-Covers validation, UUID generation, timestamp parsing, and lineage fields.
+Covers validation, deterministic ids, timestamp parsing, and lineage fields.
 """
 
 import re
+import uuid
 
 import pytest
 from pydantic import ValidationError
 
-from core.model import Transaction
+from core.model import TRANSACTION_ID_NAMESPACE, Transaction
 
 
 class TestTransactionModel:
@@ -90,7 +91,7 @@ class TestTransactionModel:
         """Test creation of valid transactions with various field combinations."""
         transaction = Transaction(**transaction_data)
 
-        # Check UUID was generated (not the original id)
+        # Check the source id was mapped to a UUID
         assert transaction.id != transaction_data["id"]
         assert re.match(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", transaction.id)
 
@@ -98,10 +99,10 @@ class TestTransactionModel:
         for field, value in expected_fields.items():
             assert getattr(transaction, field) == value
 
-    def test_uuid_generation_is_unique(self):
-        """Test that each transaction gets a unique UUID."""
-        data = {
-            "id": "same-id",
+    @staticmethod
+    def _data(transaction_id: object) -> dict:
+        return {
+            "id": transaction_id,
             "description": "Test",
             "amount": 10.0,
             "timestamp": "2026-01-11T10:00:00",
@@ -112,12 +113,29 @@ class TestTransactionModel:
             "run_id": "test-run",
         }
 
-        transaction1 = Transaction(**data)
-        transaction2 = Transaction(**data)
+    def test_id_is_deterministic(self):
+        """Test that the same source id always maps to the same UUID (idempotent re-runs)."""
+        assert Transaction(**self._data("42")).id == Transaction(**self._data("42")).id
+        assert Transaction(**self._data(42)).id == Transaction(**self._data("42")).id
 
-        assert transaction1.id != transaction2.id
-        assert transaction1.id != "same-id"
-        assert transaction2.id != "same-id"
+    def test_id_is_uuid5_of_source_id(self):
+        """Test that a non-UUID source id maps to its UUID5 in the transaction namespace."""
+        assert Transaction(**self._data("42")).id == str(uuid.uuid5(TRANSACTION_ID_NAMESPACE, "42"))
+
+    def test_different_source_ids_get_different_uuids(self):
+        """Test that distinct source ids do not collide."""
+        assert Transaction(**self._data("1")).id != Transaction(**self._data("2")).id
+
+    def test_uuid_id_is_kept(self):
+        """Test that an id that is already a UUID is kept (e.g. re-validated by the consumer)."""
+        source = "b9fa6684-502b-4695-8f92-247432ba610d"
+        assert Transaction(**self._data(source)).id == source
+
+    @pytest.mark.parametrize("transaction_id", [None, "", "   "])
+    def test_blank_id_is_rejected(self, transaction_id):
+        """Test that a missing id is a validation error, not a fresh UUID."""
+        with pytest.raises(ValidationError):
+            Transaction(**self._data(transaction_id))
 
     @pytest.mark.parametrize(
         "timestamp_str,expected_format",
