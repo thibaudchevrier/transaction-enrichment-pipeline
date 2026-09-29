@@ -17,6 +17,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Identifies the prediction logic; stored with each prediction for lineage
+MODEL_VERSION = "hash-baseline-v1"
+
 CATEGORIES = [
     "Rent",
     "Salary Income",
@@ -43,6 +46,7 @@ def predict_post(transactions: list[TransactionRequest])-> list[PredictionRespon
     return [PredictionResponse(
         transaction_id=transaction.id,
         category=CATEGORIES[hash(transaction.id) % len(CATEGORIES)],
+        model_version=MODEL_VERSION,
     ) for transaction in transactions]
 
 

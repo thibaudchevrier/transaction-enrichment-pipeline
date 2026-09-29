@@ -6,16 +6,12 @@ retry logic for resilient database interactions.
 """
 
 import logging
-import os
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import UTC, datetime
 
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, create_engine
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import Session, relationship, sessionmaker
-
-from .utils import retry_with_backoff
+from sqlalchemy.orm import Session, declarative_base, relationship, sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +49,7 @@ class Prediction(Base):
     category = Column(String, nullable=False)
     confidence_score = Column(Float, default=1.0)
     model_version = Column(String, default="v1.0")
-    predicted_at = Column(DateTime, default=datetime.utcnow)
+    predicted_at = Column(DateTime, default=lambda: datetime.now(UTC).replace(tzinfo=None))  # naive UTC column
 
     # Relationship to transaction
     transaction = relationship("Transaction", back_populates="predictions")
@@ -145,7 +141,6 @@ def db_transaction(session: Session):
         raise
 
 
-@retry_with_backoff(max_retries=int(os.getenv("MAX_RETRIES", "3")), initial_delay=1.0)
 def __bulk_insert_transactions(session: Session, transactions: list[dict]):
     """
     Insert transactions with ON CONFLICT DO NOTHING (idempotent).
@@ -173,7 +168,6 @@ def __bulk_insert_transactions(session: Session, transactions: list[dict]):
     logger.info(f"Inserted {len(transactions)} transactions (skipped duplicates)")
 
 
-@retry_with_backoff(max_retries=int(os.getenv("MAX_RETRIES", "3")), initial_delay=1.0)
 def __bulk_upsert_predictions(session: Session, predictions: list[dict]):
     """
     UPSERT predictions: insert new ones, update existing ones.
@@ -232,6 +226,12 @@ def db_write_results(session: Session, all_valid_transactions: list[dict], all_p
     Clears the input lists after successful persistence.
     Transactions are inserted idempotently (no duplicates).
     Predictions are upserted (insert or update).
+
+    Database errors are not retried here: a statement that fails leaves the
+    Postgres transaction aborted, so retrying inside it can't succeed. Errors
+    propagate, the transaction rolls back, and the run is retried as a whole
+    (Airflow task retries for batch, redelivery of uncommitted offsets for
+    streaming). Idempotent writes make those retries safe.
     """
     if all_valid_transactions:
         # Insert transactions to database (idempotent)

@@ -17,3 +17,4 @@ class TransactionRequest(BaseModel):
 class PredictionResponse(BaseModel):
     transaction_id: UUID
     category: str
+    model_version: str
