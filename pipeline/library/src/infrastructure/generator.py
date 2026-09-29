@@ -8,6 +8,7 @@ processing in the pipeline.
 import logging
 from collections.abc import Iterator
 
+import fsspec  # pyright: ignore[reportMissingTypeStubs]  # fsspec ships no stubs
 import polars as pl
 
 from core.data_validation import validate_transaction_records
@@ -48,10 +49,11 @@ def load_and_validate_transactions(
     Parameters
     ----------
     s3_path : str
-        S3 path to CSV file (e.g., 's3://bucket/file.csv').
+        S3 path to a CSV file (e.g., 's3://bucket/raw/month=2023-01/transactions.csv'),
+        or a glob over several (e.g., 's3://bucket/raw/month=*/transactions.csv').
     storage_options : dict
-        S3/MinIO credentials containing 'key', 'secret', and
-        'client_kwargs' with 'endpoint_url'.
+        fsspec options for the filesystem, e.g. S3/MinIO credentials
+        ('key', 'secret', 'client_kwargs' with 'endpoint_url').
     batch_size : int, optional
         Number of transactions per batch, by default 100.
 
@@ -64,6 +66,8 @@ def load_and_validate_transactions(
     ------
     ValueError
         If required columns are missing from the CSV.
+    FileNotFoundError
+        If no file matches ``s3_path``.
 
     Notes
     -----
@@ -72,8 +76,15 @@ def load_and_validate_transactions(
     """
     logger.info(f"Reading data from {s3_path}")
 
-    # Read CSV with Polars
-    df = pl.read_csv(s3_path, separator=";", decimal_comma=True, storage_options=storage_options)
+    fs, _, paths = fsspec.get_fs_token_paths(s3_path, storage_options=storage_options)
+    if not paths:
+        raise FileNotFoundError(f"No file matches {s3_path}")
+
+    frames = []
+    for path in paths:
+        with fs.open(path, "rb") as f:
+            frames.append(pl.read_csv(f, separator=";", decimal_comma=True))
+    df = pl.concat(frames)
 
     logger.info(f"Loaded {len(df)} raw transactions from CSV")
 

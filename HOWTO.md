@@ -344,7 +344,7 @@ psql -h localhost -p 5432 -U pipeline -d transactions
 - **Password:** `minioadmin`
 
 **What to check:**
-- `transactions` bucket: Contains `transactions_fr.csv` (10,000 records)
+- `transactions` bucket: `raw/month=YYYY-MM/transactions.csv` (16 monthly partitions, 10,000 records); `rejects/month=YYYY-MM/` holds records a batch run could not process
 - Object browser and file download
 
 ### 📊 Streaming Services

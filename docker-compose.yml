@@ -109,7 +109,7 @@ services:
       /bin/sh -c "
       mc alias set myminio http://${MINIO_HOST}:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       mc mb myminio/${MINIO_BUCKET} --ignore-existing;
-      mc cp /data/transactions_fr.csv myminio/${MINIO_BUCKET}/transactions_fr.csv;
+      mc cp --recursive /data/transactions/ myminio/${MINIO_BUCKET}/raw/;
       echo 'Data uploaded to MinIO successfully';
       "
 

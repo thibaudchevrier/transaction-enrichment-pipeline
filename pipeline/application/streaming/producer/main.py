@@ -164,7 +164,7 @@ async def main():
     """
     # Configuration
     # Read and validate CSV from MinIO
-    s3_path = "s3://transactions/transactions_fr.csv"
+    s3_path = "s3://transactions/raw/month=*/transactions.csv"  # sample from every partition
 
     storage_options = {
         "key": os.environ["KEY"],

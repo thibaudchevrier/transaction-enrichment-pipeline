@@ -1337,7 +1337,9 @@ files = [
 [package.dev-dependencies]
 dev = [
     { name = "coverage" },
+    { name = "fsspec" },
     { name = "poethepoet" },
+    { name = "polars" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "xdoctest" },
@@ -1371,7 +1373,9 @@ provides-extras = ["files"]
 [package.metadata.requires-dev]
 dev = [
     { name = "coverage", extras = ["toml"], specifier = ">=7.6.10" },
+    { name = "fsspec", specifier = ">=2026.1.0" },
     { name = "poethepoet", specifier = ">=0.32.1" },
+    { name = "polars", specifier = ">=0.19.0" },
     { name = "pytest", specifier = ">=8" },
     { name = "pytest-cov", specifier = ">=5" },
     { name = "xdoctest", specifier = "~=1.2.0" },

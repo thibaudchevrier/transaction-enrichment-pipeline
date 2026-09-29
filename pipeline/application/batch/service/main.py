@@ -5,11 +5,14 @@ from S3/MinIO, validates them, performs ML classification predictions in paralle
 and persists results to PostgreSQL database.
 """
 
+import json
 import logging
 import os
+import posixpath
+import sys
 from collections.abc import Iterator
-from datetime import datetime
 
+import fsspec
 from core import orchestrate_service
 from infrastructure import BaseService, get_db_session
 from infrastructure.generator import load_and_validate_transactions
@@ -117,7 +120,39 @@ class BatchService(BaseService):
         )
 
 
-def main():
+def write_rejects(rejects_path: str, storage_options: dict, failed: list[dict], invalid: list[dict]) -> None:
+    """
+    Write the records a run could not process next to the source data.
+
+    Parameters
+    ----------
+    rejects_path : str
+        Prefix for this run's reject files (e.g. 's3://transactions/rejects/run_id=...').
+    storage_options : dict
+        fsspec options for the filesystem (S3/MinIO credentials).
+    failed : list[dict]
+        Valid transactions whose prediction failed after all retries.
+    invalid : list[dict]
+        Records that failed validation.
+
+    Notes
+    -----
+    One JSON Lines file per kind (``failed.jsonl``, ``invalid.jsonl``), written
+    only when there is something to write. Re-running the same Airflow run
+    overwrites them, like the database writes, so retries stay idempotent.
+    """
+    for name, records in (("failed", failed), ("invalid", invalid)):
+        if not records:
+            continue
+        path = f"{rejects_path.rstrip('/')}/{name}.jsonl"
+        fs, fs_path = fsspec.url_to_fs(path, **storage_options)
+        fs.makedirs(posixpath.dirname(fs_path), exist_ok=True)  # no-op on object storage
+        with fs.open(fs_path, "w") as f:
+            f.writelines(json.dumps(record, default=str) + "\n" for record in records)
+        logger.warning(f"Wrote {len(records)} {name} records to {path}")
+
+
+def main() -> int:
     """
     Execute batch processing pipeline.
 
@@ -126,6 +161,7 @@ def main():
     - Creates database session
     - Initializes BatchService with S3/MinIO credentials
     - Runs orchestrate_service for parallel processing
+    - Writes failed and invalid records to the rejects location
 
     Environment Variables
     ---------------------
@@ -147,17 +183,21 @@ def main():
         MinIO secret key (required).
     ENDPOINT_URL : str
         MinIO endpoint URL (required).
+    SOURCE_PATH : str
+        Partition to process, e.g. 's3://transactions/raw/month=2023-01/transactions.csv' (required).
+    REJECTS_PATH : str
+        Where to write this run's rejected records (required).
+    BATCH_RUN_ID : str
+        Airflow run id, stored on each row for lineage (default: 'batch_unknown').
 
-    Notes
-    -----
-    Generates unique pipeline_run_id for tracking execution.
-    Logs configuration and progress throughout execution.
+    Returns
+    -------
+    int
+        Exit code: 1 if some predictions failed (so Airflow retries the run;
+        writes are idempotent), 0 otherwise. Invalid records don't fail the
+        run: retrying can't fix them, they are in the rejects file.
     """
     logger.info("Starting batch pipeline")
-
-    # Generate unique pipeline run ID
-    pipeline_run_id = f"batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    logger.info(f"Pipeline Run ID: {pipeline_run_id}")
 
     ml_api_url = os.getenv("ML_API_URL", "http://localhost:8000")
     row_batch_size = int(os.getenv("ROW_BATCH_SIZE", "5000"))
@@ -165,9 +205,10 @@ def main():
     api_max_workers = int(os.getenv("API_MAX_WORKERS", "5"))
     db_row_batch_size = int(os.getenv("DB_ROW_BATCH_SIZE", "1000"))
     run_id = os.getenv("BATCH_RUN_ID", "batch_unknown")
+    s3_path = os.environ["SOURCE_PATH"]
+    rejects_path = os.environ["REJECTS_PATH"]
+    logger.info(f"Run {run_id}: processing {s3_path}")
 
-    # Read and validate CSV from MinIO
-    s3_path = "s3://transactions/transactions_fr.csv"
     storage_options = {
         "key": os.environ["KEY"],
         "secret": os.environ["SECRET"],
@@ -175,7 +216,7 @@ def main():
     }
 
     with get_db_session(os.environ["DATABASE_URL"]) as session:
-        orchestrate_service(
+        _, failed, invalid = orchestrate_service(
             service=BatchService(
                 s3_path=s3_path,
                 storage_options=storage_options,
@@ -189,6 +230,9 @@ def main():
             db_row_batch_size=db_row_batch_size,
         )
 
+    write_rejects(rejects_path, storage_options, failed, invalid)
+    return 1 if failed else 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
