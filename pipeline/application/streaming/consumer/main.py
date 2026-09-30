@@ -261,6 +261,8 @@ class StreamingService(BaseService):
         Timeout Strategy:
         - Time-based: Yields partial batch if buffer_timeout seconds elapsed
         - Consecutive poll: Yields partial batch after 3 empty poll attempts
+        - Every polled message is added to the window before either check,
+          since its offset is committed with the window
         - This ensures low-latency processing with variable message rates
 
         Validation:
@@ -280,67 +282,68 @@ class StreamingService(BaseService):
         while len(raw_records) < batch_size:
             msg = self.consumer.poll(self.poll_timeout)
 
-            # Check time-based timeout (e.g., 5 seconds elapsed)
-            elapsed_time = time.time() - batch_start_time
-            if raw_records and elapsed_time >= self.buffer_timeout:
-                logger.debug(f"Yielding partial batch after {elapsed_time:.1f}s timeout: {len(raw_records)} messages")
-                # Validate accumulated records
-                valid, invalid = validate_transaction_records(raw_records)
-                # Combine validation errors with JSON errors
-                all_invalid = invalid + json_errors
-                yield (valid, all_invalid)
-                return
-
+            # Handle the message before deciding whether the window is closed: once
+            # polled, its offset is part of this window's commit, so it must be in it.
             if msg is None:
                 consecutive_timeouts += 1
-                # Yield partial batch if we have data and hit consecutive timeout threshold
-                if raw_records and consecutive_timeouts >= max_consecutive_timeouts:
-                    logger.debug(
-                        f"Yielding partial batch after {consecutive_timeouts} consecutive timeouts: "
-                        f"{len(raw_records)} messages"
-                    )
-                    # Validate accumulated records
-                    valid, invalid = validate_transaction_records(raw_records)
-                    # Combine validation errors with JSON errors
-                    all_invalid = invalid + json_errors
-                    yield (valid, all_invalid)
-                    return
-                continue
+            else:
+                consecutive_timeouts = 0  # Reset on successful message
+                self._accept(msg, raw_records, json_errors)
 
-            consecutive_timeouts = 0  # Reset on successful message
+            has_data = bool(raw_records or json_errors)
+            elapsed_time = time.time() - batch_start_time
+            if has_data and elapsed_time >= self.buffer_timeout:
+                logger.debug(f"Yielding partial batch after {elapsed_time:.1f}s timeout: {len(raw_records)} messages")
+                break
+            if has_data and consecutive_timeouts >= max_consecutive_timeouts:
+                logger.debug(
+                    f"Yielding partial batch after {consecutive_timeouts} consecutive timeouts: "
+                    f"{len(raw_records)} messages"
+                )
+                break
 
-            if msg.error():
-                logger.error(f"Consumer error: {msg.error()}")
-                continue
-
-            value = msg.value()
-            if value is None:
-                logger.warning("Received message with None value, skipping")
-                continue
-
-            # Deserialize JSON
-            try:
-                raw_data = json.loads(value.decode("utf-8"))
-                raw_records.append(raw_data)
-            except json.JSONDecodeError as exc:
-                logger.warning(f"Invalid JSON in message: {exc}")
-                json_errors.append({"raw": value.decode("utf-8", errors="replace"), "error": str(exc)})
-            except Exception as exc:
-                logger.error(f"Unexpected error deserializing message: {exc}")
-                json_errors.append({"error": str(exc)})
-
-        # Validate full batch using core validation
-        logger.debug(f"Validating batch: {len(raw_records)} records, {len(json_errors)} JSON errors")
         valid_transactions, invalid_transactions = validate_transaction_records(raw_records)
 
         # Combine validation errors with JSON deserialization errors
         all_invalid = invalid_transactions + json_errors
 
         logger.debug(
-            f"Yielding full batch: {len(valid_transactions)} valid, {len(all_invalid)} invalid "
+            f"Yielding batch: {len(valid_transactions)} valid, {len(all_invalid)} invalid "
             f"(Pydantic: {len(invalid_transactions)}, JSON: {len(json_errors)})"
         )
         yield (valid_transactions, all_invalid)
+
+    @staticmethod
+    def _accept(msg, raw_records: list[dict], json_errors: list[dict]) -> None:
+        """
+        Add a polled message to the window: decoded record, or JSON error.
+
+        Parameters
+        ----------
+        msg : Message
+            Message returned by ``Consumer.poll``.
+        raw_records : list[dict]
+            Decoded records of the window, appended to.
+        json_errors : list[dict]
+            Undecodable payloads of the window, appended to (they go to the DLQ).
+        """
+        if msg.error():
+            logger.error(f"Consumer error: {msg.error()}")
+            return
+
+        value = msg.value()
+        if value is None:
+            logger.warning("Received message with None value, skipping")
+            return
+
+        try:
+            raw_records.append(json.loads(value.decode("utf-8")))
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Invalid JSON in message: {exc}")
+            json_errors.append({"raw": value.decode("utf-8", errors="replace"), "error": str(exc)})
+        except Exception as exc:
+            logger.error(f"Unexpected error deserializing message: {exc}")
+            json_errors.append({"error": str(exc)})
 
 
 def process_window(

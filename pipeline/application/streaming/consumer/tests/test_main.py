@@ -162,3 +162,58 @@ def test_commit_offsets_raises_other_errors():
 
     with pytest.raises(KafkaException):
         commit_offsets(FakeConsumer(events, error=error))
+
+
+class FakeMessage:
+    def __init__(self, value: bytes | None):
+        self._value = value
+
+    def error(self):
+        return None
+
+    def value(self) -> bytes | None:
+        return self._value
+
+
+class ScriptedConsumer:
+    """Consumer whose poll() returns the scripted messages, then None."""
+
+    def __init__(self, messages: list[FakeMessage]):
+        self.messages = list(messages)
+
+    def poll(self, timeout: float) -> FakeMessage | None:
+        return self.messages.pop(0) if self.messages else None
+
+
+def _transaction(transaction_id: str) -> bytes:
+    return json.dumps(
+        {
+            "id": transaction_id,
+            "description": "Test",
+            "amount": 10.0,
+            "timestamp": "2026-01-11T10:00:00",
+            "merchant": "Shop",
+            "operation_type": "card_payment",
+            "side": "debit",
+            "processing_type": "streaming",
+            "run_id": "test",
+        }
+    ).encode()
+
+
+def test_window_closed_by_timeout_keeps_the_polled_message(monkeypatch):
+    """The message polled when the buffer timeout expires belongs to the window, not dropped."""
+    import main
+
+    clock = iter(range(0, 1000, 3))  # every time.time() call advances 3 s
+    monkeypatch.setattr(main.time, "time", lambda: next(clock))
+    ids = [f"00000000-0000-0000-0000-00000000000{i}" for i in range(4)]
+    consumer = ScriptedConsumer([FakeMessage(_transaction(i)) for i in ids])
+    service = main.StreamingService(consumer=consumer, ml_api_url="", db_session=None, buffer_timeout=5.0)  # type: ignore[arg-type]
+
+    seen: list[str] = []
+    while consumer.messages:
+        for valid, _ in service.read(batch_size=50):
+            seen.extend(t["id"] for t in valid)
+
+    assert seen == ids

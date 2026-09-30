@@ -124,7 +124,7 @@ services:
       dockerfile: Dockerfile
     container_name: ml-api-service
     ports:
-      - "8000:8000"
+      - "${ML_API_PUBLISHED_PORT:-8000}:8000"  # host port; override if 8000 is taken
     volumes:
       - ./ml_api/:/app
     command:
