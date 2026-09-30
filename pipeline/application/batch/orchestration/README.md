@@ -18,7 +18,7 @@ Apache Airflow DAGs for orchestrating batch transaction processing workflows. Co
 
 The orchestration module provides Apache Airflow DAGs that:
 
-1. **Schedule** - Run batch processing jobs on a defined schedule (daily at 2 AM UTC)
+1. **Schedule** - Run one batch job per monthly data partition, backfilling the dataset with catchup
 2. **Coordinate** - Manage dependencies between extraction, validation, prediction, and loading steps
 3. **Monitor** - Track job execution status and provide alerting on failures
 4. **Retry** - Automatically retry failed tasks with exponential backoff
@@ -135,13 +135,18 @@ default_args = {
 
 ### batch_pipeline_dag
 
-**Purpose:** Orchestrate daily batch processing of transaction data
+**Purpose:** Process one monthly partition of transaction data per run
 
-**Schedule:** Daily at 2:00 AM UTC (cron: `0 2 * * *`)
+**Schedule:** Monthly data intervals (`CronDataIntervalTimetable("@monthly")`) from 2023-01 to
+2024-04, with catchup and `max_active_runs=1`: enabling the DAG backfills the 16 months one at a
+time. The run for month M processes `s3://transactions/raw/month=M/transactions.csv` and writes
+records it can't process to `s3://transactions/rejects/month=M/`. Writes are idempotent, so clearing a
+run reprocesses that month safely.
 
 **Tasks:**
-1. `prepare_environment` - Extract credentials from Airflow connections
-2. `run_batch_processing` - Execute batch service in Docker container
+1. `get_environment_vars` - Extract credentials from Airflow connections and compute the partition paths
+2. `run_batch_processing` - Execute batch service in Docker container (exit 1 if predictions failed, so Airflow retries)
+3. `log_completion` - Log the run
 
 **Dependencies:**
 ```

@@ -23,9 +23,8 @@ This project implements a dual-pipeline system for transaction classification: a
 
 ## Current Architecture
 
-![Current Architecture](docs/images/current.png)
-
-*Figure 1: Current implementation with batch (Airflow) and streaming (Kafka) pipelines*
+See the architecture diagram in the [README](README.md#architecture): batch (Airflow, one monthly
+partition per run) and streaming (Kafka, with a DLQ) pipelines sharing one core library.
 
 ### Key Components
 
@@ -50,9 +49,8 @@ This project implements a dual-pipeline system for transaction classification: a
 - **Kafka Topics**: 
   - `transactions`: Incoming transaction events
   - `failed-transactions`: Dead Letter Queue (DLQ) for error handling
-  - **Replication Factor**: 3 for all topics
-    - **Rationale**: Ensures resilience and reliability
-    - **Trade-off**: Higher storage requirements for data durability
+  - **Replication Factor**: 1 locally (a single broker in Docker Compose); 3 in production, see
+    [Replication Strategy](#replication-strategy)
 
 - **Consumer Group**: Parallel processing with load distribution
 
@@ -200,9 +198,10 @@ class PredictOutput(BaseModel):
 
 ### Replication Strategy
 
-**Decision**: Replication factor of 3 for all Kafka topics
+**Decision**: Replication factor of 3 for all Kafka topics in production. The local Compose setup
+runs a single broker, so its topics use a replication factor of 1.
 
-**Rationale**:
+**Rationale** (production):
 - **Fault tolerance**: Survives up to 2 broker failures
 - **Data durability**: No data loss even with broker failures
 - **Industry best practice**: Standard for production Kafka clusters
@@ -287,7 +286,7 @@ CREATE TABLE predictions (
 **Example flow**:
 ```
 Transaction arrives → Store in transactions table ✅
-ML API call fails → DLQ (transaction still persisted)
+ML API call fails → DLQ / rejects file (today the transaction is not persisted either)
 Retry later → Add prediction to predictions table ✅
 ```
 
@@ -483,11 +482,22 @@ CREATE TABLE transactions_with_predictions (
 
 ### 3. Error Handling Strategy
 
-**Current**: Exponential backoff retries for both API calls and PostgreSQL transactions
+**Current**:
+- **ML API calls**: exponential backoff retries. Transactions still failing after the last attempt
+  go to the DLQ (streaming) or `rejects/month=…/failed.jsonl` (batch, and the run exits 1 so Airflow
+  retries it).
+- **Invalid records**: DLQ (streaming, `error_type=invalid`) or `rejects/month=…/invalid.jsonl` (batch).
+- **Database errors**: not retried in place. A failed statement leaves the Postgres transaction
+  aborted, so the whole unit is retried instead: the Airflow task for batch, redelivery of the
+  uncommitted Kafka window for streaming.
+- **Idempotency makes these retries safe**: transaction ids are deterministic (UUID5 of the source
+  id), transactions are inserted with `ON CONFLICT DO NOTHING` and predictions are upserted.
+- **Streaming delivery**: auto-commit is off; offsets are committed only after the database commit
+  and the DLQ flush (at-least-once, no loss).
 
 **Rationale**:
-- **Universal solution**: Works for various transient failures (network issues, temporary overload)
-- **Simple implementation**: Easy to understand and maintain
+- **Retry the unit that can succeed**: HTTP calls in place, database work as a whole transaction
+- **Nothing silently dropped**: every record ends up in Postgres, the DLQ or a rejects file
 - **Graceful degradation**: Backs off when service is struggling
 
 **Limitation**: 
@@ -734,34 +744,15 @@ for batch in pl.read_csv_batched("large_file.csv", batch_size=10000):
 - ✅ Can process files larger than available RAM
 - ✅ Faster time to first result
 
-### 2. Error Persistence
+### 2. Error Reprocessing
 
-**Current**: Errors logged but not persisted for reprocessing
+**Current**: Failed and invalid records are persisted (DLQ topic for streaming, `rejects/` files on
+MinIO for batch) but nothing consumes them yet.
 
-**Target**: Persist errors for analysis and retry
-
-**Batch Pipeline**:
-- Write invalid records to CSV on MinIO
-- Separate file per batch run with error details
-- Enable manual review and correction
-
-**Streaming Pipeline**:
-- Write failed messages to Dead Letter Queue (DLQ) topic
-- Include error details in message headers
-- Separate consumer for DLQ processing and alerting
-
-**Implementation**:
-```python
-# Batch: Write errors to MinIO
-errors_df.write_csv(f"s3://bucket/errors/batch_{batch_id}.csv")
-
-# Streaming: Produce to DLQ
-producer.produce(
-    topic="failed-transactions",
-    value=message_value,
-    headers={"error": error_message, "retry_count": "3"}
-)
-```
+**Target**:
+- A DLQ consumer that retries `prediction_failed` messages after a delay and alerts on `invalid` ones
+- Carry the validation error message with invalid records (today only the record and the
+  `error_type` header)
 
 ### 3. Streaming Predictions Topic
 
@@ -1108,16 +1099,16 @@ This implementation demonstrates production-grade data engineering practices wit
 
 ✅ **Clean Architecture**: Separation of domain logic and infrastructure  
 ✅ **Dual Pipelines**: Batch and streaming with shared business logic  
-✅ **Resilience**: Retry logic, error handling, replication factor of 3  
+✅ **Resilience**: Idempotent writes, at-least-once streaming, DLQ and rejects, retries  
 ✅ **Scalability**: Horizontal scaling ready, distributed processing path  
-✅ **Quality**: 48 tests passing, pre-commit hooks, type checking  
+✅ **Quality**: Unit tests (including delivery guarantees), pre-commit hooks, type checking  
 ✅ **Documentation**: Comprehensive READMEs and design notes  
 
 The architecture provides a **solid foundation** with clear paths for:
 - Enhanced observability
 - Distributed processing for scale
 - Flexible backend options via connector pattern
-- Improved error handling and persistence
+- DLQ reprocessing
 - Full test coverage and CI/CD integration
 
 **Design philosophy**: Balance pragmatism with best practices, delivering a functional system while maintaining extensibility for future requirements.
