@@ -11,6 +11,7 @@ import logging
 import os
 import random
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from confluent_kafka.aio import AIOProducer
 from infrastructure.generator import load_and_validate_transactions
@@ -78,7 +79,10 @@ async def produce_messages(
     Notes
     -----
     Messages are produced in parallel using asyncio.gather().
-    Samples are selected randomly with replacement.
+    Samples are selected randomly with replacement. Each produced event gets a
+    fresh id, as a source system would assign one per new transaction: the
+    consumer keeps UUID ids as they are, so a redelivered message deduplicates
+    while two draws of the same sample stay two distinct transactions.
     No key is used, so messages distribute round-robin across partitions.
     """
     message_count = 0
@@ -96,7 +100,8 @@ async def produce_messages(
                 try:
                     # Produce message (no key - no transaction event ordering required)
                     # Kafka will distribute messages round-robin across all partitions
-                    delivery_future = await producer.produce(topic, value=json.dumps(sample).encode("utf-8"))
+                    event = {**sample, "id": str(uuid4())}
+                    delivery_future = await producer.produce(topic, value=json.dumps(event).encode("utf-8"))
                     await delivery_future
                     logger.debug(f"Produced message #{msg_num} to topic '{topic}'")
                     return True
@@ -159,7 +164,7 @@ async def main():
     """
     # Configuration
     # Read and validate CSV from MinIO
-    s3_path = "s3://transactions/transactions_fr.csv"
+    s3_path = "s3://transactions/raw/month=*/transactions.csv"  # sample from every partition
 
     storage_options = {
         "key": os.environ["KEY"],

@@ -111,11 +111,12 @@ library/
 ### Core Modules
 
 #### `core/model.py`
-Pydantic models for transactions with automatic validation and UUID generation.
+Pydantic models for transactions with validation and deterministic ids: a UUID is kept, any other
+source id is mapped to a UUID5, so reprocessing a record yields the same id (idempotent writes).
 
 ```python
 class Transaction(BaseModel):
-    id: str              # Auto-generated UUID
+    id: str              # UUID, or UUID5 of the source id
     description: str
     amount: float
     timestamp: str       # ISO format
@@ -365,7 +366,3 @@ ML_API_URL=http://ml-api:8000
 3. Add NumPy-style docstrings to all functions
 4. Write tests for new functionality
 5. Update this README for API changes
-
-## 📝 License
-
-Internal use only - Q3 2025 Data Engineering Project

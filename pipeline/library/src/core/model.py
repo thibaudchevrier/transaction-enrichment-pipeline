@@ -5,22 +5,27 @@ providing automatic validation, type checking, and UUID generation.
 """
 
 from datetime import datetime
-from uuid import uuid4
+from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import BaseModel, ConfigDict, field_validator
+
+# Namespace for deriving transaction UUIDs from source identifiers. Changing it
+# changes every derived id, so it must stay fixed once data has been written.
+TRANSACTION_ID_NAMESPACE = uuid5(NAMESPACE_URL, "transaction-enrichment-pipeline/transaction")
 
 
 class Transaction(BaseModel):
     """
     Transaction model with validation.
 
-    Used for both CSV/Kafka input (validates and assigns UUID).
-    Ignores incoming 'id' field and always generates a new UUID.
+    Used for both CSV/Kafka input. The id is deterministic: a UUID is kept as
+    is, any other source id is mapped to a UUID5, so reprocessing the same
+    record always yields the same id and database writes stay idempotent.
 
     Attributes
     ----------
     id : str
-        Unique transaction identifier (auto-generated UUID).
+        Transaction identifier (UUID, derived from the source id).
     description : str
         Transaction description text.
     amount : float
@@ -55,26 +60,39 @@ class Transaction(BaseModel):
 
     @field_validator("id", mode="before")
     @classmethod
-    def replace_id_with_uuid(cls, _) -> str:
+    def normalize_id(cls, value: object) -> str:
         """
-        Replace incoming id with a fresh UUID.
+        Map the incoming id to a deterministic UUID.
 
         Parameters
         ----------
-        _ : Any
-            Incoming id value (ignored).
+        value : object
+            Incoming id: a UUID (kept) or any other source identifier.
 
         Returns
         -------
         str
-            Newly generated UUID string.
+            The UUID as a string.
+
+        Raises
+        ------
+        ValueError
+            If the id is missing or blank.
 
         Notes
         -----
-        Always generates a new UUID regardless of input value.
-        Ensures unique transaction identifiers across all sources.
+        The ML API requires UUIDs, while sources such as the CSV use integer
+        ids. Deriving a UUID5 (instead of drawing a random UUID) means a
+        re-run or a Kafka redelivery produces the same id, so ``ON CONFLICT``
+        deduplicates it.
         """
-        return str(uuid4())
+        if value is None or not str(value).strip():
+            raise ValueError("Transaction id is required")
+        source_id = str(value).strip()
+        try:
+            return str(UUID(source_id))
+        except ValueError:
+            return str(uuid5(TRANSACTION_ID_NAMESPACE, source_id))
 
     @field_validator("timestamp")
     @classmethod

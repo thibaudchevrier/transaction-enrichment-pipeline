@@ -9,8 +9,10 @@
 # - PostgreSQL: 15.10-alpine (LTS, stable - pinned)
 # - Flyway: 10.21 (stable migration tool - pinned)
 # - Adminer: 4.8.1 (stable database UI - pinned)
-# - MinIO: RELEASE.2024-12-18T13-15-44Z (S3-compatible storage - pinned)
-# - MinIO Client: latest (CLI tool - MinIO uses non-standard tagging, latest is stable)
+# - MinIO: bitnamilegacy/minio 2025.7.23 (S3-compatible storage - pinned)
+# - MinIO Client: bitnamilegacy/minio-client 2025.7.21 (pinned)
+#   MinIO no longer publishes images (minio/minio and minio/mc can't be pulled),
+#   so these are Bitnami's archived builds: frozen, fine for local development.
 # - Apache Kafka: 3.8.1 (stable KRaft mode - pinned to avoid breaking changes in 3.9.x)
 # - Kafka UI: v0.7.2 (stable web UI - pinned)
 # - Apache Airflow: Built from source with pinned dependencies in Dockerfile
@@ -22,6 +24,8 @@
 # 4. Verify all services start and communicate correctly
 # 5. Run integration tests: cd pipeline/library && uv run pytest tests
 # 6. Commit changes with version update notes
+
+name: transaction-enrichment-pipeline
 
 services:
   postgres:
@@ -72,7 +76,7 @@ services:
       ADMINER_DEFAULT_SERVER: postgres
 
   minio:
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
+    image: bitnamilegacy/minio:2025.7.23
     container_name: minio-storage
     ports:
       - "${MINIO_PORT}:9000"  # API
@@ -80,34 +84,37 @@ services:
     environment:
       MINIO_ROOT_USER: ${MINIO_ROOT_USER}
       MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
-    command: server /data --console-address ":9001"
+      MINIO_CONSOLE_PORT_NUMBER: "9001"
     volumes:
-      - minio_data:/data
+      - minio_data:/bitnami/minio/data
     networks:
       - ml-network
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
+      test: ["CMD", "curl", "-fs", "http://localhost:9000/minio/health/live"]
       interval: 5s
       timeout: 5s
       retries: 5
 
   minio-init:
-    # Note: MinIO uses dated release tags that may not be available in registries
-    # Using 'latest' is acceptable for init container as it's not mission-critical
-    image: minio/mc:latest
+    image: bitnamilegacy/minio-client:2025.7.21
     container_name: minio-init
     depends_on:
       minio:
         condition: service_healthy
     networks:
       - ml-network
+    environment:
+      MC_CONFIG_DIR: /tmp/.mc  # runs as a non-root user whose HOME (/) isn't writable
     volumes:
       - ./data:/data
+    # set -e: a failed upload fails the container, so dependent services don't start
     entrypoint: >
       /bin/sh -c "
+      set -e;
       mc alias set myminio http://${MINIO_HOST}:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
       mc mb myminio/${MINIO_BUCKET} --ignore-existing;
-      mc cp /data/transactions_fr.csv myminio/${MINIO_BUCKET}/transactions_fr.csv;
+      mc cp --recursive /data/transactions/ myminio/${MINIO_BUCKET}/raw/;
+      mc ls --recursive myminio/${MINIO_BUCKET}/raw/;
       echo 'Data uploaded to MinIO successfully';
       "
 
@@ -117,7 +124,7 @@ services:
       dockerfile: Dockerfile
     container_name: ml-api-service
     ports:
-      - "8000:8000"
+      - "${ML_API_PUBLISHED_PORT:-8000}:8000"  # host port; override if 8000 is taken
     volumes:
       - ./ml_api/:/app
     command:
@@ -239,6 +246,8 @@ services:
       AIRFLOW_CONN_POSTGRES_TRANSACTIONS: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@${POSTGRES_HOST}:5432/${POSTGRES_DB}
       AIRFLOW_CONN_MINIO_S3: http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@${MINIO_HOST}:9000
       AIRFLOW_CONN_ML_API: http://${ML_API_HOST}:${ML_API_PORT}
+      # Network the DockerOperator attaches batch containers to (see networks below)
+      PIPELINE_DOCKER_NETWORK: transaction-enrichment-network
     volumes:
       - ./pipeline/application/batch/orchestration/dags:/opt/airflow/dags
       - airflow-data:/opt/airflow
@@ -333,6 +342,7 @@ services:
       KAFKA_BOOTSTRAP_SERVERS: ${KAFKA_BOOTSTRAP_SERVERS}
       KAFKA_CONSUMER_GROUP: ${KAFKA_CONSUMER_GROUP}
       KAFKA_TOPIC: ${KAFKA_TOPIC}
+      KAFKA_DLQ_TOPIC: ${KAFKA_DLQ_TOPIC}
       ML_API_URL: ${ML_API_URL}
       DATABASE_URL: ${DATABASE_URL}
       MESSAGE_BATCH_SIZE: ${STREAMING_MESSAGE_BATCH_SIZE}
@@ -362,4 +372,6 @@ volumes:
 
 networks:
   ml-network:
+    # Fixed name: the Airflow DockerOperator attaches batch containers to it by name
+    name: transaction-enrichment-network
     driver: bridge

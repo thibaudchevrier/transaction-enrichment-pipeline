@@ -312,14 +312,14 @@ make restart-producers
 
 - **Connection:** `localhost:5432`
 - **Database:** `transactions`
-- **Username:** `qonto`
-- **Password:** `qonto_password`
+- **Username:** `pipeline`
+- **Password:** `pipeline_password`
 - **JDBC URL:** `jdbc:postgresql://localhost:5432/transactions`
 
 **Connect with psql:**
 
 ```bash
-psql -h localhost -p 5432 -U qonto -d transactions
+psql -h localhost -p 5432 -U pipeline -d transactions
 ```
 
 #### Adminer (Database UI)
@@ -327,8 +327,8 @@ psql -h localhost -p 5432 -U qonto -d transactions
 - **URL:** http://localhost:8080
 - **System:** PostgreSQL
 - **Server:** `postgres` (or `localhost` from outside Docker)
-- **Username:** `qonto`
-- **Password:** `qonto_password`
+- **Username:** `pipeline`
+- **Password:** `pipeline_password`
 - **Database:** `transactions`
 
 **What to check:**
@@ -344,7 +344,7 @@ psql -h localhost -p 5432 -U qonto -d transactions
 - **Password:** `minioadmin`
 
 **What to check:**
-- `transactions` bucket: Contains `transactions_fr.csv` (10,000 records)
+- `transactions` bucket: `raw/month=YYYY-MM/transactions.csv` (16 monthly partitions, 10,000 records); `rejects/month=YYYY-MM/` holds records a batch run could not process
 - Object browser and file download
 
 ### 📊 Streaming Services
@@ -457,7 +457,7 @@ make all
 
 # Or manual steps
 docker-compose down --remove-orphans
-docker ps -a | grep dataeng-q3-2025  # Check for orphaned containers
+docker ps -a | grep transaction-enrichment  # Check for orphaned containers
 docker rm -f <container-names>       # Remove any orphaned containers
 docker network prune -f              # Clean up networks
 docker-compose up -d                 # Restart
@@ -487,7 +487,7 @@ docker-compose ps postgres
 docker-compose logs postgres
 
 # Test connection
-psql -h localhost -p 5432 -U qonto -d transactions -c "SELECT COUNT(*) FROM transactions;"
+psql -h localhost -p 5432 -U pipeline -d transactions -c "SELECT COUNT(*) FROM transactions;"
 ```
 
 #### Kafka Issues
@@ -658,7 +658,7 @@ uv run poe test
 
 ```bash
 # Navigate to project root
-cd /path/to/dataeng-q3-2025
+cd /path/to/transaction-enrichment-pipeline
 
 # Test library only
 uv run poe test-library
@@ -722,7 +722,7 @@ make logs-producers
 make logs-consumer
 
 # Terminal 3: Database queries
-watch -n 2 'psql -h localhost -U qonto -d transactions -c "SELECT COUNT(*) FROM transactions;"'
+watch -n 2 'psql -h localhost -U pipeline -d transactions -c "SELECT COUNT(*) FROM transactions;"'
 ```
 
 ### Debug Service Issues
@@ -748,13 +748,13 @@ docker exec <container-name> env
 
 ```bash
 # Dump entire database
-docker exec transactions-db pg_dump -U qonto transactions > backup.sql
+docker exec transactions-db pg_dump -U pipeline transactions > backup.sql
 
 # Dump specific table
-docker exec transactions-db pg_dump -U qonto -t transactions transactions > transactions_backup.sql
+docker exec transactions-db pg_dump -U pipeline -t transactions transactions > transactions_backup.sql
 
 # Restore from backup
-cat backup.sql | docker exec -i transactions-db psql -U qonto transactions
+cat backup.sql | docker exec -i transactions-db psql -U pipeline transactions
 ```
 
 ### Scale Services
@@ -798,7 +798,7 @@ make clean-network
 
 ### Why `make down` Now Works Properly
 
-**Previous Issue:** The `! Network dataeng-q3-2025_ml-network Resource ...` warning appeared because `docker-compose down` without profiles only stopped infrastructure containers, leaving streaming/batch containers running and attached to the network.
+**Previous Issue:** The `! Network ... Resource is still in use` warning appeared because `docker-compose down` without profiles only stopped infrastructure containers, leaving streaming/batch containers running and attached to the network.
 
 **Solution:** All cleanup commands now use `--profile all` to ensure ALL containers (infrastructure + streaming + batch) are stopped together, allowing the network to be cleanly removed.
 
@@ -832,8 +832,8 @@ cd pipeline/library && uv run pre-commit run --all-files
 
 | Service | Username | Password |
 |---------|----------|----------|
-| PostgreSQL | `qonto` | `qonto_password` |
-| Adminer | `qonto` | `qonto_password` |
+| PostgreSQL | `pipeline` | `pipeline_password` |
+| Adminer | `pipeline` | `pipeline_password` |
 | Airflow | `admin` | `airflow123` |
 | MinIO | `minioadmin` | `minioadmin` |
 | Kafka UI | - | (none) |

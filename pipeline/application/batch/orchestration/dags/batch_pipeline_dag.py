@@ -1,21 +1,27 @@
 """Airflow DAG for batch transaction processing pipeline.
 
 This DAG orchestrates the batch processing of transaction data:
-- Extracts data from S3/MinIO
+- Extracts one monthly partition from S3/MinIO
 - Validates transaction records
 - Performs ML classification predictions
 - Loads results into PostgreSQL database
+- Writes rejected records next to the source data
 
-Schedule: Daily at 2 AM UTC
+Schedule: monthly data intervals. The run for month M starts once M is over
+and processes s3://transactions/raw/month=M/. With catchup, enabling the DAG
+backfills every month of the dataset (2023-01 to 2024-04), one run at a time.
+Writes are idempotent, so clearing and re-running a month is safe.
 """
 
 import logging
+import os
 from datetime import datetime, timedelta
 
 from airflow import DAG
 from airflow.providers.docker.operators.docker import DockerOperator
 from airflow.providers.standard.operators.python import PythonOperator
 from airflow.sdk.bases.hook import BaseHook
+from airflow.timetables.interval import CronDataIntervalTimetable
 
 logger = logging.getLogger(__name__)
 
@@ -65,9 +71,13 @@ with DAG(
     dag_id="batch_transaction_pipeline",
     default_args=default_args,
     description="Batch processing pipeline for transaction classification on transaction data",
-    schedule="*/2 * * * *",  # Every 2 minutes
-    start_date=datetime(2026, 1, 1),
-    catchup=False,
+    # Data intervals (not CronTriggerTimetable, Airflow 3's default for cron
+    # strings): each run gets [month start, next month start) to process.
+    schedule=CronDataIntervalTimetable("@monthly", timezone="UTC"),
+    start_date=datetime(2023, 1, 1),
+    end_date=datetime(2024, 4, 1),  # start of the last month in the dataset
+    catchup=True,
+    max_active_runs=1,
     tags=["batch", "ml", "transactions"],
 ) as dag:
     # Batch processing configuration (adjust as needed)
@@ -83,6 +93,11 @@ with DAG(
         """Retrieve secrets from Airflow Connections and add batch configuration."""
         # Get Airflow run_id for lineage tracking
         run_id = context["run_id"]
+
+        # The partition this run owns, and where its rejected records go
+        month = context["data_interval_start"].strftime("%Y-%m")
+        source_path = f"s3://transactions/raw/month={month}/transactions.csv"
+        rejects_path = f"s3://transactions/rejects/month={month}"
 
         # Get PostgreSQL connection
         postgres_conn = BaseHook.get_connection("postgres_transactions")
@@ -110,6 +125,8 @@ with DAG(
             "SECRET": minio_secret,
             "ML_API_URL": ml_api_url,
             "BATCH_RUN_ID": run_id,  # For lineage tracking
+            "SOURCE_PATH": source_path,
+            "REJECTS_PATH": rejects_path,
         }
         env_vars.update(BATCH_CONFIG)
 
@@ -127,7 +144,7 @@ with DAG(
         image="batch-processor:latest",
         api_version="auto",
         auto_remove="success",
-        network_mode="dataeng-q3-2025_ml-network",
+        network_mode=os.getenv("PIPELINE_DOCKER_NETWORK", "transaction-enrichment-network"),
         docker_url="unix://var/run/docker.sock",
         mount_tmp_dir=False,
         xcom_task_id="get_environment_vars",

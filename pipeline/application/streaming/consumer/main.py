@@ -11,8 +11,9 @@ import os
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from datetime import UTC, datetime
 
-from confluent_kafka import Consumer
+from confluent_kafka import Consumer, KafkaError, KafkaException, Producer
 from core import orchestrate_service, validate_transaction_records
 from infrastructure import BaseService, db_transaction, get_db_session
 from sqlalchemy.orm import Session
@@ -46,8 +47,19 @@ def get_kafka_consumer(bootstrap_servers: str, group_id: str, topic: str):
     Consumer automatically closes on context exit.
     Configured with 'auto.offset.reset' set to 'earliest'
     to consume from beginning if no offset exists.
+
+    Auto-commit is disabled: offsets are committed by ``process_window`` only
+    once the batch is in the database and its failures are in the DLQ, so a
+    crash leads to redelivery instead of message loss.
     """
-    c = Consumer({"bootstrap.servers": bootstrap_servers, "group.id": group_id, "auto.offset.reset": "earliest"})
+    c = Consumer(
+        {
+            "bootstrap.servers": bootstrap_servers,
+            "group.id": group_id,
+            "auto.offset.reset": "earliest",
+            "enable.auto.commit": False,
+        }
+    )
 
     c.subscribe([topic])
 
@@ -55,6 +67,86 @@ def get_kafka_consumer(bootstrap_servers: str, group_id: str, topic: str):
         yield c
     finally:
         c.close()
+
+
+@contextmanager
+def get_dlq_producer(bootstrap_servers: str):
+    """
+    Context manager for the dead letter queue producer.
+
+    Parameters
+    ----------
+    bootstrap_servers : str
+        Kafka bootstrap servers (e.g., "localhost:9092").
+
+    Yields
+    ------
+    Producer
+        Kafka producer used to publish failed and invalid records.
+
+    Notes
+    -----
+    Idempotence is enabled so producer retries don't duplicate DLQ messages.
+    Remaining messages are flushed on context exit.
+    """
+    producer = Producer({"bootstrap.servers": bootstrap_servers, "enable.idempotence": True})
+    try:
+        yield producer
+    finally:
+        producer.flush(10)
+
+
+def publish_to_dlq(producer: Producer, topic: str, records: list[dict], error_type: str) -> None:
+    """
+    Publish records to the dead letter queue.
+
+    Parameters
+    ----------
+    producer : Producer
+        Kafka producer for the DLQ topic.
+    topic : str
+        DLQ topic name.
+    records : list[dict]
+        Records to publish: failed transactions, invalid records, or
+        undecodable payloads (``{"raw": ..., "error": ...}``).
+    error_type : str
+        Why the records failed, sent as the ``error_type`` header
+        (``prediction_failed`` or ``invalid``).
+
+    Notes
+    -----
+    Does not wait for delivery; ``process_window`` flushes before committing.
+    """
+    failed_at = datetime.now(UTC).isoformat()
+    for record in records:
+        producer.produce(
+            topic,
+            value=json.dumps(record, default=str).encode("utf-8"),
+            headers=[("error_type", error_type.encode()), ("failed_at", failed_at.encode())],
+        )
+    if records:
+        logger.warning(f"Sent {len(records)} records to DLQ '{topic}' ({error_type})")
+
+
+def commit_offsets(consumer: Consumer) -> None:
+    """
+    Commit the consumer's current offsets synchronously.
+
+    Parameters
+    ----------
+    consumer : Consumer
+        Kafka consumer whose consumed positions are committed.
+
+    Notes
+    -----
+    A window that consumed nothing new has no offset to commit; Kafka
+    reports it as ``_NO_OFFSET``, which is not an error here.
+    """
+    try:
+        consumer.commit(asynchronous=False)
+    except KafkaException as exc:
+        if exc.args[0].code() != KafkaError._NO_OFFSET:  # pyright: ignore[reportAttributeAccessIssue]  # missing from stubs
+            raise
 
 
 class StreamingService(BaseService):
@@ -169,6 +261,8 @@ class StreamingService(BaseService):
         Timeout Strategy:
         - Time-based: Yields partial batch if buffer_timeout seconds elapsed
         - Consecutive poll: Yields partial batch after 3 empty poll attempts
+        - Every polled message is added to the window before either check,
+          since its offset is committed with the window
         - This ensures low-latency processing with variable message rates
 
         Validation:
@@ -188,67 +282,145 @@ class StreamingService(BaseService):
         while len(raw_records) < batch_size:
             msg = self.consumer.poll(self.poll_timeout)
 
-            # Check time-based timeout (e.g., 5 seconds elapsed)
-            elapsed_time = time.time() - batch_start_time
-            if raw_records and elapsed_time >= self.buffer_timeout:
-                logger.debug(f"Yielding partial batch after {elapsed_time:.1f}s timeout: {len(raw_records)} messages")
-                # Validate accumulated records
-                valid, invalid = validate_transaction_records(raw_records)
-                # Combine validation errors with JSON errors
-                all_invalid = invalid + json_errors
-                yield (valid, all_invalid)
-                return
-
+            # Handle the message before deciding whether the window is closed: once
+            # polled, its offset is part of this window's commit, so it must be in it.
             if msg is None:
                 consecutive_timeouts += 1
-                # Yield partial batch if we have data and hit consecutive timeout threshold
-                if raw_records and consecutive_timeouts >= max_consecutive_timeouts:
-                    logger.debug(
-                        f"Yielding partial batch after {consecutive_timeouts} consecutive timeouts: "
-                        f"{len(raw_records)} messages"
-                    )
-                    # Validate accumulated records
-                    valid, invalid = validate_transaction_records(raw_records)
-                    # Combine validation errors with JSON errors
-                    all_invalid = invalid + json_errors
-                    yield (valid, all_invalid)
-                    return
-                continue
+            else:
+                consecutive_timeouts = 0  # Reset on successful message
+                self._accept(msg, raw_records, json_errors)
 
-            consecutive_timeouts = 0  # Reset on successful message
+            has_data = bool(raw_records or json_errors)
+            elapsed_time = time.time() - batch_start_time
+            if has_data and elapsed_time >= self.buffer_timeout:
+                logger.debug(f"Yielding partial batch after {elapsed_time:.1f}s timeout: {len(raw_records)} messages")
+                break
+            if has_data and consecutive_timeouts >= max_consecutive_timeouts:
+                logger.debug(
+                    f"Yielding partial batch after {consecutive_timeouts} consecutive timeouts: "
+                    f"{len(raw_records)} messages"
+                )
+                break
 
-            if msg.error():
-                logger.error(f"Consumer error: {msg.error()}")
-                continue
-
-            value = msg.value()
-            if value is None:
-                logger.warning("Received message with None value, skipping")
-                continue
-
-            # Deserialize JSON
-            try:
-                raw_data = json.loads(value.decode("utf-8"))
-                raw_records.append(raw_data)
-            except json.JSONDecodeError as exc:
-                logger.warning(f"Invalid JSON in message: {exc}")
-                json_errors.append({"raw": value.decode("utf-8", errors="replace"), "error": str(exc)})
-            except Exception as exc:
-                logger.error(f"Unexpected error deserializing message: {exc}")
-                json_errors.append({"error": str(exc)})
-
-        # Validate full batch using core validation
-        logger.debug(f"Validating batch: {len(raw_records)} records, {len(json_errors)} JSON errors")
         valid_transactions, invalid_transactions = validate_transaction_records(raw_records)
 
         # Combine validation errors with JSON deserialization errors
         all_invalid = invalid_transactions + json_errors
 
         logger.debug(
-            f"Yielding full batch: {len(valid_transactions)} valid, {len(all_invalid)} invalid "
+            f"Yielding batch: {len(valid_transactions)} valid, {len(all_invalid)} invalid "
             f"(Pydantic: {len(invalid_transactions)}, JSON: {len(json_errors)})"
         )
         yield (valid_transactions, all_invalid)
+
+    @staticmethod
+    def _accept(msg, raw_records: list[dict], json_errors: list[dict]) -> None:
+        """
+        Add a polled message to the window: decoded record, or JSON error.
+
+        Parameters
+        ----------
+        msg : Message
+            Message returned by ``Consumer.poll``.
+        raw_records : list[dict]
+            Decoded records of the window, appended to.
+        json_errors : list[dict]
+            Undecodable payloads of the window, appended to (they go to the DLQ).
+        """
+        if msg.error():
+            logger.error(f"Consumer error: {msg.error()}")
+            return
+
+        value = msg.value()
+        if value is None:
+            logger.warning("Received message with None value, skipping")
+            return
+
+        try:
+            raw_records.append(json.loads(value.decode("utf-8")))
+        except json.JSONDecodeError as exc:
+            logger.warning(f"Invalid JSON in message: {exc}")
+            json_errors.append({"raw": value.decode("utf-8", errors="replace"), "error": str(exc)})
+        except Exception as exc:
+            logger.error(f"Unexpected error deserializing message: {exc}")
+            json_errors.append({"error": str(exc)})
+
+
+def process_window(
+    service: "StreamingService",
+    session: Session,
+    consumer: Consumer,
+    dlq_producer: Producer,
+    dlq_topic: str,
+    message_batch_size: int,
+    api_batch_size: int,
+    api_max_workers: int,
+    db_row_batch_size: int,
+) -> tuple[int, list[dict], list[dict]]:
+    """
+    Process one batch window with at-least-once delivery.
+
+    Parameters
+    ----------
+    service : StreamingService
+        Service reading the window from Kafka.
+    session : Session
+        Database session; the window is written in one transaction.
+    consumer : Consumer
+        Kafka consumer whose offsets are committed at the end.
+    dlq_producer : Producer
+        Producer for the dead letter queue.
+    dlq_topic : str
+        DLQ topic name.
+    message_batch_size : int
+        Messages per window.
+    api_batch_size : int
+        Transactions per ML API request.
+    api_max_workers : int
+        Parallel ML API workers.
+    db_row_batch_size : int
+        Threshold for bulk database writes.
+
+    Returns
+    -------
+    tuple[int, list[dict], list[dict]]
+        Processed count, failed transactions, invalid records.
+
+    Raises
+    ------
+    RuntimeError
+        If the DLQ messages could not be delivered.
+
+    Notes
+    -----
+    Steps run in this order, and offsets are committed last:
+
+    1. Write transactions and predictions (one database transaction).
+    2. Publish failed and invalid records to the DLQ and wait for delivery.
+    3. Commit the Kafka offsets.
+
+    If the process dies before step 3, the window is redelivered. Writes are
+    idempotent (deterministic ids, ``ON CONFLICT``), so a redelivery doesn't
+    duplicate rows; it can duplicate DLQ messages, which are meant to be
+    inspected, not counted.
+    """
+    with db_transaction(session):
+        processed, failed, invalid = orchestrate_service(
+            service=service,
+            row_batch_size=message_batch_size,
+            api_batch_size=api_batch_size,
+            api_max_workers=api_max_workers,
+            db_row_batch_size=db_row_batch_size,
+        )
+
+    publish_to_dlq(dlq_producer, dlq_topic, failed, "prediction_failed")
+    publish_to_dlq(dlq_producer, dlq_topic, invalid, "invalid")
+    undelivered = dlq_producer.flush(30)
+    if undelivered:
+        raise RuntimeError(f"{undelivered} DLQ messages not delivered; offsets not committed")
+
+    commit_offsets(consumer)
+    return processed, failed, invalid
 
 
 def main():
@@ -270,6 +442,8 @@ def main():
         Consumer group ID (default: 'transaction-consumer-group').
     KAFKA_TOPIC : str
         Source Kafka topic (default: 'transactions').
+    KAFKA_DLQ_TOPIC : str
+        Dead letter queue topic (default: 'failed-transactions').
     ML_API_URL : str
         ML API endpoint (default: 'http://localhost:8000').
     MESSAGE_BATCH_SIZE : int
@@ -288,14 +462,17 @@ def main():
     Notes
     -----
     Runs in infinite loop, processing batches continuously.
-    Each iteration calls orchestrate_service which handles validation,
-    prediction, and persistence for one batch window.
+    Each iteration calls process_window, which writes the window to the
+    database, sends its failures to the DLQ, then commits the offsets.
+    Any other error stops the consumer without committing; the container
+    restarts and the uncommitted window is redelivered.
     Gracefully handles KeyboardInterrupt for clean shutdown.
     """
     # Configuration
     bootstrap_servers = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
     group_id = os.getenv("KAFKA_CONSUMER_GROUP", "transaction-consumer-group")
     topic = os.getenv("KAFKA_TOPIC", "transactions")
+    dlq_topic = os.getenv("KAFKA_DLQ_TOPIC", "failed-transactions")
     ml_api_url = os.getenv("ML_API_URL", "http://localhost:8000")
 
     message_batch_size = int(os.getenv("MESSAGE_BATCH_SIZE", "50"))
@@ -316,6 +493,7 @@ def main():
 
     with (
         get_kafka_consumer(bootstrap_servers, group_id, topic) as consumer,
+        get_dlq_producer(bootstrap_servers) as dlq_producer,
         get_db_session(os.environ["DATABASE_URL"]) as session,
     ):
         service = StreamingService(
@@ -329,17 +507,19 @@ def main():
         try:
             logger.info("Starting continuous batch processing...")
             while True:
-                # Process one batch window within a transaction
-                with db_transaction(session):
-                    processed, failed, invalid = orchestrate_service(
-                        service=service,
-                        row_batch_size=message_batch_size,
-                        api_batch_size=api_batch_size,
-                        api_max_workers=api_max_workers,
-                        db_row_batch_size=db_row_batch_size,
-                    )
+                processed, failed, invalid = process_window(
+                    service=service,
+                    session=session,
+                    consumer=consumer,
+                    dlq_producer=dlq_producer,
+                    dlq_topic=dlq_topic,
+                    message_batch_size=message_batch_size,
+                    api_batch_size=api_batch_size,
+                    api_max_workers=api_max_workers,
+                    db_row_batch_size=db_row_batch_size,
+                )
 
-                # Update totals after transaction commits
+                # Update totals after the window is committed
                 total_processed += processed
                 total_failed += len(failed)
                 total_invalid += len(invalid)

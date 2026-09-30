@@ -1,7 +1,7 @@
 [project]
-name = "dataeng-q3-2025"
+name = "transaction-enrichment-pipeline"
 version = "0.1.0"
-description = "Data Engineering Q3 2025 - Transaction Classification Pipeline"
+description = "Batch (Airflow) and streaming (Kafka) pipelines enriching transactions with an ML category"
 readme = "README.md"
 requires-python = ">=3.12"
 

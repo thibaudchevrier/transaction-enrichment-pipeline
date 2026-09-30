@@ -27,15 +27,14 @@ def validate_transaction_records(records: list[dict]) -> tuple[list[dict], list[
     -------
     tuple[list[dict], list[dict]]
         Tuple containing:
-        - List of validated transaction dictionaries (with auto-generated UUIDs).
+        - List of validated transaction dictionaries (ids normalized to deterministic UUIDs).
         - List of invalid transaction error dictionaries.
 
     Notes
     -----
-    The Transaction model auto-generates UUIDs via default_factory.
+    The Transaction model maps source ids to deterministic UUIDs.
     Validation errors are logged for debugging purposes.
     """
-    # Validate and auto-assign UUIDs
     validated_transactions = []
     invalid_transactions = []
 
@@ -43,7 +42,6 @@ def validate_transaction_records(records: list[dict]) -> tuple[list[dict], list[
 
     for record in records:
         try:
-            # Transaction model auto-generates UUID via default_factory
             validated_transactions.append(Transaction(**record).model_dump())
 
         except PydanticValidationError as e:

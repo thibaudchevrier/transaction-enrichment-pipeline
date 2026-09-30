@@ -28,12 +28,14 @@ def retry_with_backoff(max_retries: int = 3, initial_delay: float = 1.0):
     Returns
     -------
     Callable
-        Decorated function that returns (result, None) on success
-        or (transactions, None) on failure.
+        Decorated function that returns the wrapped function's result on
+        success, or ``(transactions, None)`` once all attempts failed, where
+        ``transactions`` is its first argument.
 
     Notes
     -----
     The delay doubles after each failed attempt (exponential backoff).
+    Only ``requests`` errors are retried: this is meant for HTTP calls.
     Failed batches are logged and their transactions are returned for
     potential reprocessing.
     """
@@ -43,28 +45,28 @@ def retry_with_backoff(max_retries: int = 3, initial_delay: float = 1.0):
         def wrapper(*args, **kwargs) -> tuple[list[dict] | None, list[dict] | None]:
             delay = initial_delay
             transactions = args[0] if args else None
-            batch_id = args[1] if len(args) > 1 else kwargs.get("batch_id", "unknown")
+            size = len(transactions) if transactions is not None else 0
 
             for attempt in range(max_retries):
                 try:
                     result = func(*args, **kwargs)
 
                     if attempt > 0:
-                        logger.info(f"Batch {batch_id}: Retry succeeded on attempt {attempt + 1}")
+                        logger.info(f"Batch of {size}: retry succeeded on attempt {attempt + 1}")
 
                     return result
 
                 except requests.exceptions.RequestException as e:
                     if attempt < max_retries - 1:
                         logger.warning(
-                            f"Batch {batch_id}: Attempt {attempt + 1}/{max_retries} failed - {e}. "
+                            f"Batch of {size}: attempt {attempt + 1}/{max_retries} failed - {e}. "
                             f"Retrying in {delay:.1f}s..."
                         )
                         time.sleep(delay)
                         delay *= 2  # Exponential backoff
                     else:
                         logger.error(
-                            f"Batch {batch_id}: All {max_retries} attempts failed - {e}. "
+                            f"Batch of {size}: all {max_retries} attempts failed - {e}. "
                             f"Moving transactions to failed queue."
                         )
                         return transactions, None

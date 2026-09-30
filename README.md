@@ -1,140 +1,128 @@
-# Data Engineer Skill Test
+# transaction-enrichment-pipeline
 
-First of all, thanks a lot for taking the time to go through this case. We know your time is valuable, and we really appreciate your commitment.
-For this test, you'll be building 2 pipelines to get incoming transactions categorized.
+Two pipelines that enrich bank transactions with a category from an ML service and store them in
+Postgres. One is **batch** (Airflow, monthly partitions from object storage), the other **streaming**
+(Kafka). Both run the same core logic, and both are safe to re-run: every write is idempotent,
+so retries and redeliveries never create duplicates.
 
+The ML service is a stub (`category = CATEGORIES[hash(id) % len(CATEGORIES)]`). This project is
+about the pipelines around a model, not the model itself.
 
-## Instructions
+## Architecture
 
-The objective of this skill test is to assess how you would build a simple, and reliable pipelines to
-ingest data from a CSV file, ask predictions to a ml service, and store results to DB. The ML API has already been bootstrapped, and you can find
-some code available in the `ml_api` folder.
+```mermaid
+flowchart LR
+    subgraph storage["MinIO (S3)"]
+        raw["raw/month=YYYY-MM/<br/>transactions.csv"]
+        rejects["rejects/month=YYYY-MM/<br/>failed.jsonl · invalid.jsonl"]
+    end
 
-We are asking you to build a solution, that can both read data as batch from a CSV file, and consume data in real-time with Kafka.
+    subgraph batch["Batch"]
+        airflow["Airflow DAG<br/>@monthly, catchup"] -->|"DockerOperator<br/>1 run = 1 month"| batchsvc["batch service"]
+    end
 
-Additional Information:
- - An example of how to test the API is described in the last section of this README. 
- - There is a CSV file with 10k transactions that you can find in the `data` folder.
- - Use any library or framework you want to build the pipeline
- - Use any database you want to store the results
- - Update the `docker-compose.yml` file to add any additional services you need 
- - Revamp the `ml_api` if you want to add more code, tests, etc. Just keep the same prediction logic, i.e. ```category=CATEGORIES[hash(transaction.id) % len(CATEGORIES)]```
- - Feel free to add data quality, validation, and any observability tools that you think could be useful
- - Think about how to make the pipelines resilient, scalable, and flexible.
+    subgraph streaming["Streaming"]
+        producers["2 producers<br/>(simulated traffic)"] --> topic[["transactions"]]
+        topic --> consumer["consumer"]
+        consumer --> dlq[["failed-transactions<br/>(DLQ)"]]
+    end
 
-
-### Requirements
-
-Expected items to deliver: 
- - **A Python service running end-to-end that will process the CSV file as batch and in real time**, call the ml service, and store results to a DB. **The two pipelines must be resilient, scalable, and maintainable**.
- - A note/README section on how to run the 2 different pipelines batch, and real-time (Kafka).
- - A note/README to explain the design choices you made, and what you had in mind, but lacked time to implement it.
-Feel free to add any diagrams or notes that you think are relevant.
-
-   
-## Running the Service
-
-### Prerequisites
-
-- Docker & Docker Compose installed on your machine
-
-### Installation
-
-To help you get predictions, we have provided a very simple ml prediction system that given
-a transaction, will return a category based on it's hashed id.
-
-1. Start Docker
-2. Run ```docker-compose up --build``` in the root directory of the project
-3. Server should be running on http://localhost:8000
-4. You can test to send a payload on the `/predict` endpoint this way:
-    ```bash
-    curl -X POST http://localhost:8000/predict \
-      -H "Content-Type: application/json" \
-      -d '[{
-          "id": "b9fa6684-502b-4695-8f92-247432ba610d",
-          "description": "Weekly grocery shopping at Whole Foods",
-          "amount": 100,
-          "timestamp": "2023-04-15T14:30:00",
-          "merchant": "Whole Foods Market",
-          "operation_type": "card_payment",
-          "side": "credit"
-      }]'
-    ```
-
----
-
-## 📚 Documentation
-
-### For Reviewers & Evaluators
-
-This project includes comprehensive documentation to help you understand and evaluate the implementation:
-
-- **[HOWTO.md](HOWTO.md)** - Complete operational guide
-  - How to run batch and streaming pipelines
-  - Service endpoints and credentials
-  - Monitoring and troubleshooting
-  - Quick reference guide
-
-- **[NOTES.md](NOTES.md)** - Design choices and architecture
-  - Architectural decisions and rationale
-  - Technology stack justification
-  - Performance characteristics
-  - Future enhancements and trade-offs
-  - **Architecture diagrams included**
-
-### For Developers
-
-Component-specific documentation:
-- [Library README](pipeline/library/README.md) - Hexagonal architecture & shared components
-- [Batch Service](pipeline/application/batch/service/README.md) - CSV processing details
-- [Streaming Consumer](pipeline/application/streaming/consumer/README.md) - Kafka consumer implementation
-- [Streaming Producer](pipeline/application/streaming/producer/README.md) - Event generation
-- [Orchestration](pipeline/application/batch/orchestration/README.md) - Airflow DAGs
-
-### Quick Start
-
-```bash
-# Start all services (batch + streaming + infrastructure)
-make all
-
-# Check service status
-make status
-
-# View logs
-make logs
-
-# Stop everything
-make down
-
-# Clean everything (including volumes)
-make clean
+    raw --> batchsvc
+    raw --> producers
+    batchsvc --> rejects
+    batchsvc -->|POST /predict| api["ML API<br/>(FastAPI)"]
+    consumer -->|POST /predict| api
+    batchsvc -->|"upsert"| pg[("Postgres<br/>transactions · predictions")]
+    consumer -->|"upsert"| pg
 ```
 
-### Project Statistics
+Batch and streaming share one library (`pipeline/library`): validation, orchestration (parallel API
+calls, bulk writes) and the database layer. Each pipeline only implements how it **reads** its source.
 
-| Metric | Value |
-|--------|-------|
-| **Total Lines of Code** | ~3,500+ |
-| **Documentation** | 2,700+ lines |
-| **Tests** | 48 (100% passing) |
-| **Services** | 10+ containerized |
-| **README files** | 8 comprehensive guides |
-| **Make commands** | 20+ automation tasks |
+## Design decisions
 
----
+**Idempotent writes.** Transaction ids are deterministic: a UUID is kept, and any other source id is
+mapped to a UUID5, so the same row always gets the same id. Transactions are inserted with
+`ON CONFLICT DO NOTHING` and predictions are upserted. Re-running a month, retrying a task or
+redelivering a Kafka message never duplicates a row.
 
-## ✅ Requirements Checklist
+**At-least-once streaming, with no data loss.** Kafka auto-commit is off. Each window is processed in
+this order: write to Postgres in one transaction → publish failures to the DLQ and wait for delivery →
+commit the offsets. If the consumer dies at any step, the window is redelivered, and the idempotent
+writes absorb it. These guarantees are unit-tested (`pipeline/application/streaming/consumer/tests`).
 
-- ✅ **Batch pipeline** - CSV processing with Airflow orchestration
-- ✅ **Streaming pipeline** - Kafka producers/consumers for real-time
-- ✅ **ML API integration** - Classification service with retry logic
-- ✅ **Database storage** - PostgreSQL with lineage tracking
-- ✅ **Resilience** - Error handling, retries, DLQ, health checks
-- ✅ **Scalability** - Parallel processing, partitioning, containerization
-- ✅ **Maintainability** - Clean architecture, tests, documentation
-- ✅ **Data quality** - Pydantic validation, error tracking
-- ✅ **Observability** - Kafka UI, Adminer, Airflow UI, logging
-- ✅ **Documentation** - HOWTO.md, NOTES.md, 6 component READMEs
-- ✅ **Design notes** - Architectural decisions explained
-- ✅ **Architecture diagrams** - System and data flow visualizations
+**Batch runs own a partition.** The data is split by month (`raw/month=YYYY-MM/`). The DAG uses monthly
+data intervals with catchup, so enabling it backfills 2023-01 → 2024-04, one run per month, each
+processing only its own partition. Clearing a month in Airflow reprocesses exactly that month.
 
+**Failures are kept, not just logged.**
+| Failure | Streaming | Batch |
+|---------|-----------|-------|
+| Invalid record (schema, JSON) | DLQ, `error_type=invalid` | `rejects/month=…/invalid.jsonl`; the run succeeds, since retrying can't fix bad data |
+| ML API still failing after retries (exponential backoff) | DLQ, `error_type=prediction_failed` | `rejects/month=…/failed.jsonl`; the run exits 1 so Airflow retries it |
+| Database error | Rollback, consumer restarts, window redelivered | Rollback, Airflow retries the run |
+
+**Lineage.** Each row stores `processing_type` (batch/streaming) and `run_id` (the Airflow run or the
+producer), and each prediction stores the `model_version` returned by the API.
+
+More detail, including trade-offs and the target architecture, is in [NOTES.md](NOTES.md).
+
+## Quick start
+
+Requires Docker (with Compose) and make.
+
+```bash
+make all      # creates .env from .env.example, builds and starts everything
+make status   # container status
+make down     # stop (make clean also removes volumes)
+```
+
+- **Streaming** starts right away: the producers publish continuously and the consumer writes to Postgres.
+- **Batch**: the DAG is enabled at start and backfills the 16 months one by one. Follow it in Airflow.
+
+| Service | URL | Credentials |
+|---------|-----|-------------|
+| Airflow | http://localhost:8082 | `admin` / `airflow123` |
+| Kafka UI (topics, DLQ, consumer lag) | http://localhost:8081 | |
+| Adminer (Postgres) | http://localhost:8080 | server `postgres`, `pipeline` / `pipeline_password`, db `transactions` |
+| MinIO console | http://localhost:9001 | `minioadmin` / `minioadmin` |
+| ML API docs | http://localhost:8000/docs | |
+
+These are local development credentials. [HOWTO.md](HOWTO.md) is the full operating guide
+(running each pipeline separately, logs, troubleshooting).
+
+## Repository layout
+
+| Path | Content |
+|------|---------|
+| `pipeline/library/` | Shared library: `core` (models, validation, orchestration) and `infrastructure` (ML API client, Postgres, file loading) |
+| `pipeline/application/batch/service/` | Batch job: reads one partition, writes results and rejects |
+| `pipeline/application/batch/orchestration/` | Airflow DAG running the batch job with the DockerOperator |
+| `pipeline/application/streaming/producer/` | Simulated transaction traffic |
+| `pipeline/application/streaming/consumer/` | Kafka consumer: DB write → DLQ → offset commit |
+| `ml_api/` | Stub prediction service (FastAPI) |
+| `migrations/` | Postgres schema (Flyway) |
+| `data/transactions/` | Source data, 10,000 transactions in monthly partitions |
+
+Each component has its own README. Every Python component is a uv workspace member with its own
+lockfile and Docker image.
+
+## Development
+
+```bash
+cd pipeline/library && uv run pytest                          # library tests
+cd pipeline/application/streaming/consumer && uv run pytest   # delivery-guarantee tests
+uv run pre-commit run --all-files                             # ruff, pyright, pydocstyle, tests
+```
+
+## Roadmap
+
+- CI (GitHub Actions): lint and tests, plus a `docker compose` smoke test
+- Observability: Prometheus metrics (throughput, failures, API latency, consumer lag), OpenTelemetry
+  traces carried through Kafka headers, a provisioned Grafana dashboard and alerts
+
+## Context
+
+This started as a take-home data-engineering exercise: build a batch and a real-time pipeline that
+categorize transactions through a provided ML API, with the prediction logic kept as given. It has
+since been reworked as a portfolio project.
