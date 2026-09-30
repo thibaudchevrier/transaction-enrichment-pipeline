@@ -137,15 +137,19 @@ def write_rejects(rejects_path: str, storage_options: dict, failed: list[dict], 
 
     Notes
     -----
-    One JSON Lines file per kind (``failed.jsonl``, ``invalid.jsonl``), written
-    only when there is something to write. Re-running the same Airflow run
-    overwrites them, like the database writes, so retries stay idempotent.
+    One JSON Lines file per kind (``failed.jsonl``, ``invalid.jsonl``). Each run
+    owns its month's rejects: files are overwritten, and a kind with nothing
+    to report is removed, so a successful retry doesn't leave the previous
+    attempt's failures behind.
     """
     for name, records in (("failed", failed), ("invalid", invalid)):
-        if not records:
-            continue
         path = f"{rejects_path.rstrip('/')}/{name}.jsonl"
         fs, fs_path = fsspec.url_to_fs(path, **storage_options)
+        if not records:
+            if fs.exists(fs_path):
+                fs.rm(fs_path)
+                logger.info(f"Removed stale {path}")
+            continue
         fs.makedirs(posixpath.dirname(fs_path), exist_ok=True)  # no-op on object storage
         with fs.open(fs_path, "w") as f:
             f.writelines(json.dumps(record, default=str) + "\n" for record in records)
